@@ -27,3 +27,6 @@ uv.lock
 .env
 .env.local
 .env
+
+# Logs
+logs/

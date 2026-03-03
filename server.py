@@ -11,6 +11,8 @@ import json
 import time
 import uuid
 import hmac
+import os
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import apple_fm_sdk as fm
@@ -84,22 +86,40 @@ def estimate_tokens(text: str) -> int:
 
 def truncate_messages(messages: List[Message], max_chars: int = MAX_PROMPT_CHARS) -> List[Message]:
     """Keep system message(s) + as many recent messages as fit within *max_chars*."""
-    system_msgs = [m for m in messages if m.role == "system"]
-    non_system = [m for m in messages if m.role != "system"]
+    if settings.strip_system_prompt:
+        non_system = [m for m in messages if m.role != "system"]
+        budget = max_chars
+        kept: list[Message] = []
+        for m in reversed(non_system):
+            cost = len(f"{m.role}: {m.content}\n")
+            if budget - cost < 0 and kept:
+                break
+            budget -= cost
+            kept.append(m)
+        kept.reverse()
+        
+        # Inject the custom, Apple-safe system prompt
+        if settings.custom_system_prompt:
+            kept.insert(0, Message(role="system", content=settings.custom_system_prompt))
+            
+        return kept
+    else:
+        system_msgs = [m for m in messages if m.role == "system"]
+        non_system = [m for m in messages if m.role != "system"]
 
-    budget = max_chars
-    for m in system_msgs:
-        budget -= len(m.content)
+        budget = max_chars
+        for m in system_msgs:
+            budget -= len(m.content)
 
-    kept: list[Message] = []
-    for m in reversed(non_system):
-        cost = len(f"{m.role}: {m.content}\n")
-        if budget - cost < 0 and kept:
-            break
-        budget -= cost
-        kept.append(m)
-    kept.reverse()
-    return system_msgs + kept
+        kept: list[Message] = []
+        for m in reversed(non_system):
+            cost = len(f"{m.role}: {m.content}\n")
+            if budget - cost < 0 and kept:
+                break
+            budget -= cost
+            kept.append(m)
+        kept.reverse()
+        return system_msgs + kept
 
 
 def build_prompt(messages: List[Message]) -> Tuple[Optional[str], str]:
@@ -232,50 +252,69 @@ def map_sdk_error(exc: Exception, prompt: str) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-async def stream_response(session, prompt: str, instructions: Optional[str]):
+async def stream_response(session, prompt: str, instructions: Optional[str], original_messages: List[Message]):
     """Yield SSE chunks via real Apple Foundation Model streaming."""
     cid = _completion_id()
     created_at = int(time.time())
 
-    # 1 — role announcement
-    yield _sse(_chunk(cid, {"role": "assistant"}))
+    def _make_sse(data) -> str:
+        """Build SSE line."""
+        if isinstance(data, str):
+            return f"data: {data}\n\n"
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    # 1 — role announcement + empty content (matches OpenAI exactly)
+    yield _make_sse({
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": created_at,
+        "model": MODEL_ID,
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+    })
 
     # 2 — stream content
+    full_text = ""
     try:
         async with concurrency_limiter:
             async with asyncio.timeout(settings.request_timeout):
                 previous_text = ""
-                # stream_response yields the accumulated string at each snapshot
                 async for snapshot in session.stream_response(prompt):
                     snapshot_text = str(snapshot)
-                    delta = snapshot_text.removeprefix(previous_text)
-                    if not delta:
-                        delta = snapshot_text
                     
+                    if snapshot_text == previous_text:
+                        continue
+                    
+                    if snapshot_text.startswith(previous_text):
+                        delta = snapshot_text[len(previous_text):]
+                    else:
+                        delta = snapshot_text
+                        
                     previous_text = snapshot_text
                     
                     if delta:
-                        yield _sse(_chunk(cid, {"content": delta}))
+                        yield _make_sse({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": created_at,
+                            "model": MODEL_ID,
+                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                        })
                         await asyncio.sleep(0.001)
+                
+                full_text = previous_text
 
     except TimeoutError:
-        yield _sse({"error": {"message": "Request timed out", "type": "timeout_error"}})
+        yield _make_sse({"error": {"message": "Request timed out", "type": "timeout_error"}})
         return
     except Exception as exc:
         err_res = map_sdk_error(exc, prompt)
         err_dict = json.loads(err_res.body.decode("utf-8"))
-        yield _sse(err_dict)
+        yield _make_sse(err_dict)
         return
 
-    # 3 — empty content
-    yield _sse(_chunk(cid, {"content": ""}))
-
-    # 4 — finish reason
-    yield _sse(_chunk(cid, {}, finish_reason="stop"))
-
-    # 5 — usage statistics
+    # 3 — usage
     prompt_tokens = estimate_tokens(instructions or "") + estimate_tokens(prompt)
-    completion_tokens = estimate_tokens(previous_text)
+    completion_tokens = estimate_tokens(full_text)
     
     usage = {
         "prompt_tokens": prompt_tokens,
@@ -283,7 +322,10 @@ async def stream_response(session, prompt: str, instructions: Optional[str]):
         "total_tokens": prompt_tokens + completion_tokens,
     }
     
-    yield _sse({
+    print(f"INFO: [Stream] Token Usage - User(Prompt): {prompt_tokens}, Assistant(Completion): {completion_tokens}")
+
+    # 4 — finish (single stop chunk with usage)
+    yield _make_sse({
         "id": cid,
         "object": "chat.completion.chunk",
         "created": created_at,
@@ -292,8 +334,32 @@ async def stream_response(session, prompt: str, instructions: Optional[str]):
         "usage": usage
     })
 
-    # 6 — done
+    # 5 — done
     yield "data: [DONE]\n\n"
+
+    # 6 — log payload (if debug enabled)
+    if settings.debug_payload:
+        os.makedirs("logs", exist_ok=True)
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S") + f"_{now.microsecond // 1000:03d}"
+        log_file = f"logs/{timestamp}_assistant.json"
+        
+        response_data = {
+            "id": cid,
+            "object": "chat.completion",
+            "created": created_at,
+            "model": MODEL_ID,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": full_text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": usage,
+        }
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(response_data, indent=2, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +399,30 @@ async def chat_completions(req: ChatCompletionRequest):
             content={"error": {"message": f"Model unavailable: {reason}", "type": "server_error"}}
         )
 
+    # Process and build prompt (this handles stripping system messages if enabled)
     instructions, prompt = build_prompt(req.messages)
+    
+    # Log the EFFECTIVE request payload (what the Apple model actually sees)
+    if settings.debug_payload:
+        os.makedirs("logs", exist_ok=True)
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S") + f"_{now.microsecond // 1000:03d}"
+        log_file = f"logs/{timestamp}_user.json"
+        
+        # Build a copy of the payload to reflect exactly what we evaluated
+        log_req = req.model_copy(deep=True)
+        if settings.strip_system_prompt:
+            log_req.messages = [m for m in log_req.messages if m.role != "system"]
+            if settings.custom_system_prompt:
+                log_req.messages.insert(0, Message(role="system", content=settings.custom_system_prompt))
+            
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(log_req.model_dump_json(indent=2) + "\n")
     session = fm.LanguageModelSession(instructions=instructions)
 
     if req.stream:
         return StreamingResponse(
-            stream_response(session, prompt, instructions),
+            stream_response(session, prompt, instructions, req.messages),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
         )
@@ -359,7 +443,9 @@ async def chat_completions(req: ChatCompletionRequest):
     prompt_tokens = estimate_tokens(instructions or "") + estimate_tokens(prompt)
     completion_tokens = estimate_tokens(completion_text)
 
-    return {
+    print(f"INFO: [Normal] Token Usage - User(Prompt): {prompt_tokens}, Assistant(Completion): {completion_tokens}")
+
+    response_data = {
         "id": _completion_id(),
         "object": "chat.completion",
         "created": int(time.time()),
@@ -377,6 +463,15 @@ async def chat_completions(req: ChatCompletionRequest):
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+
+    if settings.debug_payload:
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S") + f"_{now.microsecond // 1000:03d}"
+        log_file = f"logs/{timestamp}_assistant.json"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(response_data, indent=2, ensure_ascii=False) + "\n")
+
+    return response_data
 
 
 @app.get("/v1/models", dependencies=[Depends(verify_auth)])
@@ -451,7 +546,18 @@ def cli():
     parser.add_argument("--host", default=settings.host, help=f"Bind address (default: {settings.host})")
     parser.add_argument("--port", type=int, default=settings.port, help="Port")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    parser.add_argument("--strip-system-prompt", action="store_true", default=settings.strip_system_prompt, help="Strip system prompts (useful for Opencode and Copilot to avoid Apple Guardrails)")
+    parser.add_argument("--custom-system-prompt", default=settings.custom_system_prompt, help="Custom system prompt to inject when --strip-system-prompt is enabled")
+    parser.add_argument("--debug-payload", action="store_true", default=settings.debug_payload, help="Log full request/response JSONs to ./logs directory")
     args = parser.parse_args()
+
+    # Override settings with CLI args if specified
+    if args.strip_system_prompt:
+        settings.strip_system_prompt = True
+    if args.custom_system_prompt != settings.custom_system_prompt:
+        settings.custom_system_prompt = args.custom_system_prompt
+    if args.debug_payload:
+        settings.debug_payload = True
 
     # Determine port
     if args.port is not None:

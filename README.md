@@ -144,6 +144,9 @@ This starts the server on `0.0.0.0:8000` by default.
 | `--host` | Bind address | `0.0.0.0` or `APPLE_AI_HOST` |
 | `--port` | Port number | Auto-detected or `APPLE_AI_PORT` |
 | `--reload` | Auto-reload on code changes (dev mode) | off |
+| `--strip-system-prompt` | Strip out "system" role messages | off or `APPLE_AI_STRIP_SYSTEM_PROMPT` |
+| `--custom-system-prompt` | System prompt to inject when stripping is enabled | `"You are a helpful coding assistant."` |
+| `--debug-payload` | Log request and response JSON to `./logs/` | off or `APPLE_AI_DEBUG_PAYLOAD` |
 
 Example:
 
@@ -178,6 +181,9 @@ You can configure the server using environment variables. It is highly recommend
 | `APPLE_AI_MAX_CONCURRENCY` | Max simultaneous requests to Foundation Model | `4` |
 | `APPLE_AI_REQUEST_TIMEOUT` | Timeout in seconds | `30.0` |
 | `APPLE_AI_API_KEY` | Optional Bearer token for authentication | `None` |
+| `APPLE_AI_STRIP_SYSTEM_PROMPT` | Set to `true` to remove system prompts (useful for Opencode) | `False` |
+| `APPLE_AI_CUSTOM_SYSTEM_PROMPT` | The replacement prompt injected when `STRIP_SYSTEM_PROMPT` is true | `"You are a helpful coding assistant."` |
+| `APPLE_AI_DEBUG_PAYLOAD` | Set to `true` to log requests/responses to `./logs/` | `False` |
 
 **Security Note on `APPLE_AI_HOST`:**
 By default, the server binds to `0.0.0.0`, allowing other devices on your local network (LAN) to connect to your Mac and use your Apple Intelligence. If you want to restrict access to *only your local machine*, set `APPLE_AI_HOST=127.0.0.1`.
@@ -283,6 +289,19 @@ To connect the Apple Foundation Model to OpenCode, add the following to your `op
 ```
 
 Restart OpenCode and select `apple-fm-local/apple-intelligence`.
+
+### Client Rejections & Guardrails (Important)
+
+Apple's Foundation Model has built-in security mechanisms to prevent Jailbreaks or Instruction Overrides. IDE plugins (like Opencode or Copilot) often prepend massive, thousands-of-words-long `system` prompts filled with behavioral instructions (e.g., "You are an expert programmer... You must reply in JSON..."). 
+
+When Apple Intelligence receives these massive behavioral overrides, it will often directly reject the prompt, resulting in responses like:
+> *"I apologize, but I cannot comply with that request."*
+
+**Solution:** If your editor constantly receives rejection messages, start the server using the `--strip-system-prompt` flag (or `APPLE_AI_STRIP_SYSTEM_PROMPT=true` in your `.env` file). This completely removes the hidden `role="system"` instruction block before sending it to the Apple model.
+
+By default, the server will inject a minimal replacement prompt (`"You are a helpful coding assistant."`) to maintain safety context without triggering guardrails. You can fully customize this using the `--custom-system-prompt` flag (or `APPLE_AI_CUSTOM_SYSTEM_PROMPT` environment variable in your `.env` file).
+
+To further investigate what your IDE is sending, use the `--debug-payload` flag (or `APPLE_AI_DEBUG_PAYLOAD=true` in your `.env` file). This will write every raw request and response to a `logs/` directory so you can inspect the hidden prompts.
 
 ---
 

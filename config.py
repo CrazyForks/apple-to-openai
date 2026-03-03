@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     max_concurrency: int = Field(default=4, ge=1, le=128)
     request_timeout: float = Field(default=30.0, gt=0.0, le=60.0)
     api_key: Optional[str] = None
+    strip_system_prompt: bool = Field(default=False)
+    custom_system_prompt: str = Field(default="You are a helpful coding assistant.")
+    debug_payload: bool = Field(default=False)
     
     @property
     def is_port_fixed(self) -> bool:

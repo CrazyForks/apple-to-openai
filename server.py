@@ -42,10 +42,26 @@ MODEL_ID = "apple-intelligence"
 MAX_PROMPT_CHARS = 10000  # ~2,000 tokens input, leaving ~2,000 tokens for output (4,096 total)
 
 # Validate SDK is available (graceful degradation)
+UNAVAILABLE_HINTS = {
+    fm.SystemLanguageModelUnavailableReason.APPLE_INTELLIGENCE_NOT_ENABLED: (
+        "Enable it in System Settings > Apple Intelligence & Siri."
+    ),
+    fm.SystemLanguageModelUnavailableReason.DEVICE_NOT_ELIGIBLE: (
+        "This device does not support Apple Intelligence."
+    ),
+    fm.SystemLanguageModelUnavailableReason.MODEL_NOT_READY: (
+        "The model is still downloading; retry once it finishes."
+    ),
+}
+
 try:
     model = fm.SystemLanguageModel()
-    is_available, reason = model.is_available()
-    if not is_available:
+    is_available, raw_reason = model.is_available()
+    if is_available:
+        reason = None
+    else:
+        hint = UNAVAILABLE_HINTS.get(raw_reason, "")
+        reason = f"{raw_reason.name}{' — ' + hint if hint else ''}"
         print(f"Warning: Foundation model not available: {reason}")
 except Exception as e:
     is_available = False
